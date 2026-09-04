@@ -10,13 +10,12 @@ const CHUNK_SIZE        = 64 * 1024;
 const BUFFER_THRESHOLD  = 1 * 1024 * 1024;
 const BUFFER_RESUME     = 256 * 1024;
 const WS_RECONNECT_MS   = 3_000;
+
+// Usando apenas STUN confiável do Google (igual ao PairDrop)
+// A negociação será feita em background para evitar timeouts!
 const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302'  },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80',                username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443',               username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' }
 ];
 
 const ICONS = ['🐬','🦊','🐺','🦁','🐯','🦅','🦈','🐙','🦋','🦎',
@@ -96,8 +95,6 @@ class WebRTCConnection extends EventTarget {
     this._rxSize     = 0;
     this._rxFileInfo = null;
 
-    // ICE candidate queue — evita race condition onde candidatos chegam
-    // antes da descrição remota estar configurada
     this._pendingCandidates = [];
     this._remoteDescSet     = false;
 
@@ -105,7 +102,7 @@ class WebRTCConnection extends EventTarget {
   }
 
   _init () {
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
+    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate)
@@ -177,13 +174,11 @@ class WebRTCConnection extends EventTarget {
     this.sig.send({ type: 'signal', to: this.peerId, data: { sdp: this.pc.localDescription } });
   }
 
-  // ── CORRECTED: ICE candidate queuing to avoid race condition ──
   async handleSignal ({ sdp, candidate }) {
     if (sdp) {
       await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
       this._remoteDescSet = true;
 
-      // Processa candidatos que chegaram antes da descrição remota estar pronta
       for (const c of this._pendingCandidates) {
         try { await this.pc.addIceCandidate(new RTCIceCandidate(c)); }
         catch (e) { console.warn('[ICE] queued candidate failed', e.message); }
@@ -200,9 +195,7 @@ class WebRTCConnection extends EventTarget {
         try { await this.pc.addIceCandidate(new RTCIceCandidate(candidate)); }
         catch (e) { console.warn('[ICE] addIceCandidate failed', e.message); }
       } else {
-        // Descrição remota ainda não pronta — enfileira para processar depois
         this._pendingCandidates.push(candidate);
-        console.log(`[ICE] queued candidate (total: ${this._pendingCandidates.length})`);
       }
     }
   }
@@ -317,14 +310,24 @@ const UI = {
     setTimeout(() => { el.classList.remove('show'); el.addEventListener('transitionend', () => el.remove(), { once: true }); }, duration);
   },
 
-  // Botão de download — nunca bloqueado pelo browser pois é clique do usuário
-  toastDownload (fileName, blob) {
+  // Auto-download tradicional + fallback de botão
+  triggerDownload (fileName, blob) {
     const url = URL.createObjectURL(blob);
-    const el  = document.createElement('div');
-    el.className     = 'toast toast-success';
+    
+    // Tenta baixar automaticamente
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    // Mostra o toast com botão como fallback (caso o popup blocker bloqueie)
+    const el = document.createElement('div');
+    el.className = 'toast toast-success';
     el.style.cssText = 'display:flex;align-items:center;gap:10px;padding-right:8px;';
     el.innerHTML = `
-      <span>📥 <strong>${fileName}</strong></span>
+      <span>✅ <strong>${fileName}</strong></span>
       <a href="${url}" download="${fileName}"
          style="background:#2ea043;color:#fff;padding:4px 12px;border-radius:6px;
                 text-decoration:none;font-size:.85rem;white-space:nowrap;">⬇ Salvar</a>
@@ -404,7 +407,7 @@ function wireConnection (conn, peerId, role, filesToSend) {
     });
 
     conn.addEventListener('file-done', e => {
-      UI.toastDownload(e.detail.info.name, e.detail.blob);
+      UI.triggerDownload(e.detail.info.name, e.detail.blob);
     });
 
     conn.addEventListener('transfer-done', () => {
@@ -415,12 +418,28 @@ function wireConnection (conn, peerId, role, filesToSend) {
   }
 
   if (role === 'send') {
-    conn.addEventListener('channel-open', async () => {
-      UI.openSendProgress(peerName);
-      await conn.sendFiles(filesToSend);
-      UI.closeSendProgress();
-      UI.toast('✅ Todos os arquivos enviados!', 'success');
-      activeConns.delete(peerId);
+    conn._isAccepted = false;
+    conn._isOpen = false;
+
+    const checkStart = async () => {
+      if (conn._isAccepted && conn._isOpen && filesToSend) {
+        UI.openSendProgress(peerName);
+        await conn.sendFiles(filesToSend);
+        filesToSend = null; // limpa após enviar
+        UI.closeSendProgress();
+        UI.toast('✅ Todos os arquivos enviados!', 'success');
+        activeConns.delete(peerId);
+      }
+    };
+
+    conn.addEventListener('channel-open', () => {
+      conn._isOpen = true;
+      checkStart();
+    });
+
+    conn.addEventListener('accepted', () => {
+      conn._isAccepted = true;
+      checkStart();
     });
 
     conn.addEventListener('send-progress', e => {
@@ -429,14 +448,12 @@ function wireConnection (conn, peerId, role, filesToSend) {
     });
   }
 
-  // 'closed' = encerramento normal — NÃO é erro
-  // 'failed' = falha real de ICE — mostrar aviso
   conn.addEventListener('state-change', e => {
     if (e.detail === 'failed') {
       activeConns.delete(peerId);
       UI.closeSendProgress();
       UI.closeReceiveProgress();
-      UI.toast('❌ Conexão P2P falhou. Tente novamente.', 'error');
+      UI.toast('❌ Conexão P2P falhou.', 'error');
     } else if (e.detail === 'closed') {
       activeConns.delete(peerId);
     }
@@ -446,10 +463,16 @@ function wireConnection (conn, peerId, role, filesToSend) {
 async function startTransfer (peerId, files) {
   if (!files?.length || !myPeerId) return;
   if (activeConns.has(peerId)) { UI.toast('Já existe uma transferência em andamento.', 'warning'); return; }
+  
   const fileInfos = Array.from(files).map(f => ({ name: f.name, size: f.size, type: f.type }));
   const conn = new WebRTCConnection(peerId, signaling, true);
   wireConnection(conn, peerId, 'send', files);
   activeConns.set(peerId, conn);
+
+  // Iniciar WebRTC *imediatamente* em background para evitar timeout de ICE, igual ao PairDrop!
+  conn.createOffer().catch(e => console.error('[webrtc] offer error', e));
+
+  // Pedir permissão ao usuário
   signaling.send({ type: 'transfer-request', to: peerId, files: fileInfos });
   UI.toast('⏳ Aguardando confirmação…', 'info', 5000);
 }
@@ -504,11 +527,8 @@ signaling.addEventListener('msg', ({ detail: msg }) => {
       const conn = activeConns.get(msg.from);
       if (!conn) break;
       if (msg.accepted) {
-        conn.createOffer().catch(e => {
-          console.error('[webrtc] createOffer error', e);
-          UI.toast('❌ Erro ao iniciar conexão P2P.', 'error');
-          conn.close(); activeConns.delete(msg.from);
-        });
+        // Dispara o evento de aceitação. Se o WebRTC já conectou em background, envia os arquivos agora!
+        conn.dispatchEvent(new Event('accepted'));
       } else {
         UI.toast('❌ Transferência recusada pelo destinatário.', 'error');
         conn.close(); activeConns.delete(msg.from); UI.closeSendProgress();
