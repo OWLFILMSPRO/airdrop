@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="description" content="Transfira arquivos entre dispositivos na mesma rede — sem nuvem, sem cadastro." />
+  <title>OWL AirDrop</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦅</text></svg>" />
+  <!-- __OWL__ config é injetada pelo server.js antes desta linha -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── Header ────────────────────────────────────────────────── -->
+  <header>
+    <a class="logo" href=".">
+      <span class="logo-icon">🦅</span>
+      <span>OWL AirDrop</span>
+    </a>
+
+    <div class="device-badge">
+      <span class="dot" id="connection-dot"></span>
+      <span id="my-name">Conectando...</span>
+    </div>
+  </header>
+
+  <!-- ── Main ─────────────────────────────────────────────────── -->
+  <main>
+    <p id="status-msg" style="display:none"></p>
+
+    <div id="peers-area">
+      <div id="peers-grid">
+        <div id="empty-state" style="display:flex">
+          <span class="empty-icon">📡</span>
+          <h3>Nenhum dispositivo encontrado</h3>
+          <p>Abra esta página em outro dispositivo na mesma rede Wi-Fi para começar.</p>
+        </div>
+      </div>
+    </div>
+
+    <p class="hint">
+      Clique em um dispositivo ou arraste arquivos sobre ele para enviar &nbsp;·&nbsp;
+      Transferência direta via WebRTC
+    </p>
+  </main>
+
+  <!-- ── Toast container ───────────────────────────────────────── -->
+  <div id="toast-container" aria-live="polite"></div>
+
+  <!-- Modal: aceitar / recusar transferência -->
+  <div class="modal-overlay" id="receive-modal" role="dialog" aria-modal="true" aria-labelledby="receive-title">
+    <div class="modal">
+      <h2 id="receive-title">📥 Receber arquivos?</h2>
+      <p class="subtitle">
+        <strong id="receive-from"></strong> quer enviar:
+      </p>
+      <ul class="file-list" id="receive-file-list"></ul>
+      <p class="total-size" id="receive-total-size"></p>
+      <div class="modal-buttons">
+        <button class="btn btn-ghost"   id="receive-reject">Recusar</button>
+        <button class="btn btn-primary" id="receive-accept">Aceitar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: progresso de recebimento -->
+  <div class="modal-overlay" id="receive-progress-modal" role="dialog" aria-modal="true" aria-labelledby="rp-title">
+    <div class="modal">
+      <h2 id="rp-title">⬇️ Recebendo...</h2>
+      <p class="subtitle">De: <strong id="rp-from"></strong></p>
+      <div class="progress-info">
+        <div class="progress-label" id="rp-filename"></div>
+        <div class="progress-track">
+          <div class="progress-bar" id="rp-bar" style="width:0%"></div>
+        </div>
+        <div class="progress-meta">
+          <span class="progress-bytes"   id="rp-bytes"></span>
+          <span class="progress-counter" id="rp-counter"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: progresso de envio -->
+  <div class="modal-overlay" id="send-progress-modal" role="dialog" aria-modal="true" aria-labelledby="sp-title">
+    <div class="modal">
+      <h2 id="sp-title">⬆️ Enviando...</h2>
+      <p class="subtitle">Para: <strong id="sp-to"></strong></p>
+      <div class="progress-info">
+        <div class="progress-label" id="sp-filename"></div>
+        <div class="progress-track">
+          <div class="progress-bar" id="sp-bar" style="width:0%"></div>
+        </div>
+        <div class="progress-meta">
+          <span class="progress-bytes" id="sp-bytes"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
