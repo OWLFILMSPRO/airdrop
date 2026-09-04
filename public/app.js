@@ -136,7 +136,8 @@ class WebRTCConnection extends EventTarget {
 
   // ── Setup ─────────────────────────────────────────────────
   _init () {
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    // max-bundle ajuda muito na estabilidade com celulares na rede local
+    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
 
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
@@ -164,6 +165,9 @@ class WebRTCConnection extends EventTarget {
 
   _bindChannel (ch) {
     ch.binaryType = 'arraybuffer';
+    
+    // ESTA É A LINHA MÁGICA QUE FALTAVA: destrava o envio de arquivos grandes!
+    ch.bufferedAmountLowThreshold = BUFFER_RESUME;
 
     ch.onopen  = () => {
       console.log(`[DataChannel] open with ${this.peerId.slice(0,8)}`);
@@ -544,6 +548,7 @@ function wireConnection (conn, peerId, role, filesToSend) {
       UI.closeSendProgress();
       UI.toast('✅ Todos os arquivos enviados!', 'success');
       activeConns.delete(peerId);
+      // O conn.close() que cortava a ligação antes da hora foi removido!
     });
 
     conn.addEventListener('send-progress', e => {
@@ -679,9 +684,13 @@ signaling.addEventListener('msg', ({ detail: msg }) => {
 
       if (msg.accepted) {
         // Now initiate the WebRTC handshake
-        conn.createOffer().catch(e =>
-          console.error('[webrtc] createOffer error', e)
-        );
+        conn.createOffer().catch(e => {
+          console.error('[webrtc] createOffer error', e);
+          UI.toast('❌ Erro na conexão P2P.', 'error');
+          conn.close();
+          activeConns.delete(msg.from);
+          UI.closeSendProgress();
+        });
       } else {
         UI.toast('❌ Transferência recusada pelo destinatário.', 'error');
         conn.close();
