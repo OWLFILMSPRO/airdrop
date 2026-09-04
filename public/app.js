@@ -10,11 +10,15 @@ const CHUNK_SIZE        = 64 * 1024;          // 64 KB per DataChannel send
 const BUFFER_THRESHOLD  = 1 * 1024 * 1024;    // pause sends above 1 MB buffered
 const BUFFER_RESUME     = 256 * 1024;         // resume below 256 KB
 const WS_RECONNECT_MS   = 3_000;
-const ICE_SERVERS       = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun.l.google.com:53' },
-  { urls: 'stun:stun.l.google.com:80' },
-  { urls: 'stun:global.stun.twilio.com:3478' }
+// STUN + TURN para garantir conexão mesmo entre Ethernet e WiFi no mesmo roteador.
+// TURN é um relay gratuito (Open Relay Project) — usado como fallback quando P2P direto falha.
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302'  },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80',               username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443',              username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 // Peer icons — chosen deterministically by name
@@ -36,9 +40,9 @@ const activeConns = new Map();
 // ═══════════════════════════════════════════════════════════════
 function formatBytes (bytes) {
   if (bytes === 0) return '0 B';
-  if (bytes < 1024)               return `${bytes} B`;
-  if (bytes < 1024 ** 2)          return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3)          return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes < 1024)       return `${bytes} B`;
+  if (bytes < 1024 ** 2)  return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3)  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
@@ -54,31 +58,26 @@ function peerIcon (name) {
 class SignalingClient extends EventTarget {
   constructor () {
     super();
-    this._ws            = null;
+    this._ws             = null;
     this._reconnectTimer = null;
     this._connect();
   }
 
   _connect () {
     const proto  = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // wsPath injetado pelo server.js: '/ws' (root) ou '/airdrop/ws' (subpath)
     const wsPath = (window.__OWL__ && window.__OWL__.wsPath) || '/airdrop/ws';
     const url    = `${proto}//${location.host}${wsPath}`;
-
     this._ws = new WebSocket(url);
 
     this._ws.onopen = () => {
       clearTimeout(this._reconnectTimer);
       this.dispatchEvent(new Event('open'));
     };
-
     this._ws.onclose = () => {
       this.dispatchEvent(new Event('close'));
       this._reconnectTimer = setTimeout(() => this._connect(), WS_RECONNECT_MS);
     };
-
-    this._ws.onerror = () => {/* close fires after, handled there */};
-
+    this._ws.onerror = () => {};
     this._ws.onmessage = ({ data }) => {
       try {
         const msg = JSON.parse(data);
@@ -90,60 +89,37 @@ class SignalingClient extends EventTarget {
   }
 
   send (obj) {
-    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+    if (this._ws && this._ws.readyState === WebSocket.OPEN)
       this._ws.send(JSON.stringify(obj));
-    }
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // WebRTC Connection
 // ═══════════════════════════════════════════════════════════════
-/**
- * Wraps one RTCPeerConnection + RTCDataChannel pair.
- *
- * Events dispatched (CustomEvent.detail varies):
- *   'channel-open'    — DataChannel is ready
- *   'file-start'      — { name, size, mimeType, fileIndex, totalFiles }
- *   'file-chunk'      — { chunk: ArrayBuffer, received, total }
- *   'file-done'       — { blob, info }
- *   'transfer-done'   — all files finished
- *   'send-progress'   — { sent, total, fileName, fileIndex, totalFiles }
- *   'state-change'    — RTCPeerConnection.connectionState string
- */
 class WebRTCConnection extends EventTarget {
-  /**
-   * @param {string}           peerId
-   * @param {SignalingClient}  signaling
-   * @param {boolean}          initiator  true = creates offer + DataChannel
-   */
   constructor (peerId, signaling, initiator) {
     super();
     this.peerId    = peerId;
     this.sig       = signaling;
     this.initiator = initiator;
-
-    this.pc      = null;
-    this.channel = null;
-
-    // Receive bookkeeping
+    this.pc        = null;
+    this.channel   = null;
     this._rxBuf      = [];
     this._rxSize     = 0;
     this._rxFileInfo = null;
-
     this._init();
   }
 
-  // ── Setup ─────────────────────────────────────────────────
   _init () {
-    // max-bundle ajuda muito na estabilidade com celulares na rede local
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
+    this.pc = new RTCPeerConnection({
+      iceServers  : ICE_SERVERS,
+      bundlePolicy: 'max-bundle',
+    });
 
     this.pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        this.sig.send({ type: 'signal', to: this.peerId,
-                        data: { candidate } });
-      }
+      if (candidate)
+        this.sig.send({ type: 'signal', to: this.peerId, data: { candidate } });
     };
 
     this.pc.onconnectionstatechange = () => {
@@ -165,27 +141,21 @@ class WebRTCConnection extends EventTarget {
 
   _bindChannel (ch) {
     ch.binaryType = 'arraybuffer';
-    
-    // ESTA É A LINHA MÁGICA QUE FALTAVA: destrava o envio de arquivos grandes!
     ch.bufferedAmountLowThreshold = BUFFER_RESUME;
 
     ch.onopen  = () => {
-      console.log(`[DataChannel] open with ${this.peerId.slice(0,8)}`);
+      console.log(`[DataChannel] open → ${this.peerId.slice(0,8)}`);
       this.dispatchEvent(new Event('channel-open'));
     };
-    ch.onclose = () => console.log(`[DataChannel] closed`);
-    ch.onerror = e  => console.error(`[DataChannel] error`, e);
+    ch.onclose = () => console.log('[DataChannel] closed');
+    ch.onerror = e  => console.error('[DataChannel] error', e);
 
     ch.onmessage = ({ data }) => {
-      if (typeof data === 'string') {
-        this._handleControl(JSON.parse(data));
-      } else {
-        this._handleBinary(data);
-      }
+      if (typeof data === 'string') this._handleControl(JSON.parse(data));
+      else                          this._handleBinary(data);
     };
   }
 
-  // ── Receive side ──────────────────────────────────────────
   _handleControl (msg) {
     switch (msg.type) {
       case 'file-start':
@@ -215,15 +185,10 @@ class WebRTCConnection extends EventTarget {
     this._rxBuf.push(chunk);
     this._rxSize += chunk.byteLength;
     this.dispatchEvent(new CustomEvent('file-chunk', {
-      detail: {
-        chunk,
-        received : this._rxSize,
-        total    : this._rxFileInfo?.size ?? 0,
-      }
+      detail: { chunk, received: this._rxSize, total: this._rxFileInfo?.size ?? 0 }
     }));
   }
 
-  // ── Signaling ─────────────────────────────────────────────
   async createOffer () {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
@@ -241,65 +206,41 @@ class WebRTCConnection extends EventTarget {
                         data: { sdp: this.pc.localDescription } });
       }
     } else if (candidate) {
-      try {
-        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (e) {
-        console.warn('[ICE] addIceCandidate failed', e.message);
-      }
+      try { await this.pc.addIceCandidate(new RTCIceCandidate(candidate)); }
+      catch (e) { console.warn('[ICE] addIceCandidate failed', e.message); }
     }
   }
 
-  // ── Send side ─────────────────────────────────────────────
-  /** @param {FileList|File[]} files */
   async sendFiles (files) {
     const list = Array.from(files);
-
-    for (let i = 0; i < list.length; i++) {
-      await this._sendOneFile(list[i], i, list.length);
-    }
-
+    for (let i = 0; i < list.length; i++) await this._sendOneFile(list[i], i, list.length);
     this.channel.send(JSON.stringify({ type: 'transfer-done' }));
   }
 
   async _sendOneFile (file, index, total) {
     this.channel.send(JSON.stringify({
-      type      : 'file-start',
-      name      : file.name,
-      size      : file.size,
-      mimeType  : file.type || 'application/octet-stream',
-      fileIndex : index,
-      totalFiles: total,
+      type: 'file-start', name: file.name, size: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      fileIndex: index, totalFiles: total,
     }));
 
     let offset = 0;
     while (offset < file.size) {
-      // Respect DataChannel buffer to avoid dropping chunks
       await this._drainBuffer();
-
-      const slice  = file.slice(offset, offset + CHUNK_SIZE);
-      const buffer = await slice.arrayBuffer();
+      const buffer = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
       this.channel.send(buffer);
       offset += buffer.byteLength;
-
       this.dispatchEvent(new CustomEvent('send-progress', {
-        detail: {
-          sent      : Math.min(offset, file.size),
-          total     : file.size,
-          fileName  : file.name,
-          fileIndex : index,
-          totalFiles: total,
-        }
+        detail: { sent: Math.min(offset, file.size), total: file.size,
+                  fileName: file.name, fileIndex: index, totalFiles: total }
       }));
     }
-
     this.channel.send(JSON.stringify({ type: 'file-done', fileIndex: index }));
   }
 
   _drainBuffer () {
     return new Promise(resolve => {
-      if (this.channel.bufferedAmount < BUFFER_THRESHOLD) {
-        resolve(); return;
-      }
+      if (this.channel.bufferedAmount < BUFFER_THRESHOLD) { resolve(); return; }
       const check = () => {
         if (this.channel.bufferedAmount <= BUFFER_RESUME) resolve();
         else setTimeout(check, 30);
@@ -308,7 +249,6 @@ class WebRTCConnection extends EventTarget {
     });
   }
 
-  // ── Teardown ──────────────────────────────────────────────
   close () {
     try { this.channel?.close(); } catch {}
     try { this.pc?.close();      } catch {}
@@ -319,22 +259,15 @@ class WebRTCConnection extends EventTarget {
 // UI helpers
 // ═══════════════════════════════════════════════════════════════
 const UI = {
-  // ── DOM refs ─────────────────────────────────────────────
-  $  : id => document.getElementById(id),
-  peersGrid : null,
+  $: id => document.getElementById(id),
+  peersGrid: null,
 
-  init () {
-    this.peersGrid = this.$('peers-grid');
-  },
+  init () { this.peersGrid = this.$('peers-grid'); },
 
-  // ── Own device ───────────────────────────────────────────
-  setMyName (name) {
-    this.$('my-name').textContent = name;
-  },
+  setMyName  (name) { this.$('my-name').textContent = name; },
 
   setConnected (ok) {
-    const dot = this.$('connection-dot');
-    dot.className = 'dot ' + (ok ? 'connected' : 'disconnected');
+    this.$('connection-dot').className = 'dot ' + (ok ? 'connected' : 'disconnected');
   },
 
   showStatus (msg, isError = false) {
@@ -344,12 +277,10 @@ const UI = {
     el.style.display = msg ? 'block' : 'none';
   },
 
-  // ── Peer cards ───────────────────────────────────────────
   createPeerCard (peerId, displayName) {
-    const card    = document.createElement('div');
-    card.className       = 'peer-card';
-    card.dataset.peerId  = peerId;
-
+    const card = document.createElement('div');
+    card.className      = 'peer-card';
+    card.dataset.peerId = peerId;
     const icon = peerIcon(displayName);
 
     card.innerHTML = `
@@ -366,21 +297,15 @@ const UI = {
     const avatar    = card.querySelector('.peer-avatar');
     const fileInput = card.querySelector('.file-input');
 
-    // Click / keyboard → open picker
     const openPicker = () => fileInput.click();
     avatar.addEventListener('click', openPicker);
     avatar.addEventListener('keydown', e => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPicker(); }
     });
-
     fileInput.addEventListener('change', () => {
-      if (fileInput.files.length) {
-        startTransfer(peerId, fileInput.files);
-        fileInput.value = '';
-      }
+      if (fileInput.files.length) { startTransfer(peerId, fileInput.files); fileInput.value = ''; }
     });
 
-    // Drag & Drop
     avatar.addEventListener('dragenter', e => { e.preventDefault(); card.classList.add('drag-over'); });
     avatar.addEventListener('dragover',  e => { e.preventDefault(); });
     avatar.addEventListener('dragleave', e => {
@@ -393,7 +318,6 @@ const UI = {
     });
 
     this.peersGrid.appendChild(card);
-    // Animate in next frame
     requestAnimationFrame(() => requestAnimationFrame(() => card.classList.add('visible')));
     this.updateEmpty();
     return card;
@@ -408,13 +332,11 @@ const UI = {
     this.$('empty-state').style.display = knownPeers.size === 0 ? 'flex' : 'none';
   },
 
-  // ── Toasts ───────────────────────────────────────────────
   toast (msg, type = 'info', duration = 3500) {
-    const wrap  = this.$('toast-container');
-    const el    = document.createElement('div');
+    const el = document.createElement('div');
     el.className   = `toast toast-${type}`;
     el.textContent = msg;
-    wrap.appendChild(el);
+    this.$('toast-container').appendChild(el);
     requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
     setTimeout(() => {
       el.classList.remove('show');
@@ -422,11 +344,29 @@ const UI = {
     }, duration);
   },
 
-  // ── Receive confirm modal ─────────────────────────────────
-  showReceivePrompt (fromName, files, callback) {
-    const modal   = this.$('receive-modal');
-    this.$('receive-from').textContent = fromName;
+  // Botão de download — nunca bloqueado pelo browser pois é clique do usuário
+  toastDownload (fileName, blob) {
+    const url = URL.createObjectURL(blob);
+    const el  = document.createElement('div');
+    el.className     = 'toast toast-success';
+    el.style.cssText = 'display:flex;align-items:center;gap:10px;padding-right:8px;';
+    el.innerHTML = `
+      <span>📥 <strong>${fileName}</strong></span>
+      <a href="${url}" download="${fileName}"
+         style="background:#2ea043;color:#fff;padding:4px 12px;border-radius:6px;
+                text-decoration:none;font-size:.85rem;white-space:nowrap;">⬇ Salvar</a>
+    `;
+    this.$('toast-container').appendChild(el);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
+    setTimeout(() => {
+      el.classList.remove('show');
+      el.addEventListener('transitionend', () => { el.remove(); URL.revokeObjectURL(url); }, { once: true });
+    }, 60_000);
+  },
 
+  showReceivePrompt (fromName, files, callback) {
+    const modal = this.$('receive-modal');
+    this.$('receive-from').textContent = fromName;
     const listEl = this.$('receive-file-list');
     listEl.innerHTML = '';
     let total = 0;
@@ -437,21 +377,17 @@ const UI = {
       listEl.appendChild(li);
     });
     this.$('receive-total-size').textContent = `Total: ${formatBytes(total)}`;
-
     modal.classList.add('open');
-
     const close = accepted => {
       modal.classList.remove('open');
       this.$('receive-accept').onclick = null;
       this.$('receive-reject').onclick = null;
       callback(accepted);
     };
-
     this.$('receive-accept').onclick = () => close(true);
     this.$('receive-reject').onclick = () => close(false);
   },
 
-  // ── Receive progress modal ────────────────────────────────
   openReceiveProgress (fromName) {
     this.$('rp-from').textContent = fromName;
     this.$('receive-progress-modal').classList.add('open');
@@ -469,10 +405,9 @@ const UI = {
     this.$('receive-progress-modal').classList.remove('open');
   },
 
-  // ── Send progress modal ───────────────────────────────────
   openSendProgress (toName) {
-    this.$('sp-to').textContent  = toName;
-    this.$('sp-bar').style.width = '0%';
+    this.$('sp-to').textContent       = toName;
+    this.$('sp-bar').style.width      = '0%';
     this.$('sp-filename').textContent = '…';
     this.$('sp-bytes').textContent    = '';
     this.$('send-progress-modal').classList.add('open');
@@ -480,7 +415,7 @@ const UI = {
 
   updateSendProgress (fileName, sent, total, fileIndex, totalFiles) {
     const pct = total > 0 ? Math.round(sent / total * 100) : 0;
-    this.$('sp-bar').style.width    = `${pct}%`;
+    this.$('sp-bar').style.width      = `${pct}%`;
     this.$('sp-filename').textContent = fileName;
     this.$('sp-bytes').textContent    =
       `${formatBytes(sent)} / ${formatBytes(total)}  ·  Arquivo ${fileIndex + 1}/${totalFiles}`;
@@ -494,26 +429,17 @@ const UI = {
 // ═══════════════════════════════════════════════════════════════
 // Transfer orchestration
 // ═══════════════════════════════════════════════════════════════
-
-/**
- * Attach event listeners to a WebRTCConnection for both sender and receiver.
- * @param {WebRTCConnection} conn
- * @param {string}           peerId
- * @param {'send'|'recv'}    role
- * @param {FileList}         [filesToSend]  only when role==='send'
- */
 function wireConnection (conn, peerId, role, filesToSend) {
   const peer     = knownPeers.get(peerId);
   const peerName = peer?.displayName ?? 'Dispositivo';
 
-  // ── Receive side ─────────────────────────────────────────
   if (role === 'recv') {
-    let currentFileIndex = 0, currentFileTotalFiles = 1;
+    let curIdx = 0, curTotal = 1;
 
     conn.addEventListener('file-start', e => {
       const { name, size, fileIndex, totalFiles } = e.detail;
-      currentFileIndex     = fileIndex;
-      currentFileTotalFiles = totalFiles;
+      curIdx   = fileIndex;
+      curTotal = totalFiles;
       UI.openReceiveProgress(peerName);
       UI.updateReceiveProgress(name, 0, size, fileIndex, totalFiles);
     });
@@ -521,16 +447,13 @@ function wireConnection (conn, peerId, role, filesToSend) {
     conn.addEventListener('file-chunk', e => {
       const { received, total } = e.detail;
       const info = conn._rxFileInfo;
-      UI.updateReceiveProgress(
-        info?.name ?? '', received, total,
-        currentFileIndex, currentFileTotalFiles
-      );
+      UI.updateReceiveProgress(info?.name ?? '', received, total, curIdx, curTotal);
     });
 
     conn.addEventListener('file-done', e => {
       const { blob, info } = e.detail;
-      triggerDownload(blob, info.name);
-      UI.toast(`✅ ${info.name} recebido!`, 'success');
+      // Botão de download — usuário clica para salvar (nunca bloqueado pelo browser)
+      UI.toastDownload(info.name, blob);
     });
 
     conn.addEventListener('transfer-done', () => {
@@ -540,7 +463,6 @@ function wireConnection (conn, peerId, role, filesToSend) {
     });
   }
 
-  // ── Send side ─────────────────────────────────────────────
   if (role === 'send') {
     conn.addEventListener('channel-open', async () => {
       UI.openSendProgress(peerName);
@@ -548,7 +470,7 @@ function wireConnection (conn, peerId, role, filesToSend) {
       UI.closeSendProgress();
       UI.toast('✅ Todos os arquivos enviados!', 'success');
       activeConns.delete(peerId);
-      // O conn.close() que cortava a ligação antes da hora foi removido!
+      // Não fechamos aqui — o receptor fecha após salvar o arquivo
     });
 
     conn.addEventListener('send-progress', e => {
@@ -557,51 +479,31 @@ function wireConnection (conn, peerId, role, filesToSend) {
     });
   }
 
-  // ── Shared: connection failures ──────────────────────────
+  // 'closed' = encerramento normal — NÃO é erro
+  // 'failed' = falha real de ICE/WebRTC — mostrar aviso
   conn.addEventListener('state-change', e => {
-    if (e.detail === 'failed' || e.detail === 'closed') {
+    if (e.detail === 'failed') {
       activeConns.delete(peerId);
       UI.closeSendProgress();
       UI.closeReceiveProgress();
-      if (e.detail === 'failed') UI.toast('❌ Conexão P2P falhou.', 'error');
+      UI.toast('❌ Conexão P2P falhou. Tente novamente.', 'error');
+    } else if (e.detail === 'closed') {
+      activeConns.delete(peerId);
     }
   });
 }
 
-/**
- * Initiate a file transfer to a remote peer.
- * @param {string}   peerId
- * @param {FileList} files
- */
 async function startTransfer (peerId, files) {
   if (!files?.length || !myPeerId) return;
   if (activeConns.has(peerId)) {
     UI.toast('Já existe uma transferência em andamento.', 'warning'); return;
   }
-
-  const fileInfos = Array.from(files).map(f => ({
-    name: f.name, size: f.size, type: f.type
-  }));
-
-  // Build the RTCPeerConnection now (initiator), but don't create offer yet.
-  // The offer is created after the receiver accepts.
+  const fileInfos = Array.from(files).map(f => ({ name: f.name, size: f.size, type: f.type }));
   const conn = new WebRTCConnection(peerId, signaling, true);
   wireConnection(conn, peerId, 'send', files);
   activeConns.set(peerId, conn);
-
-  // Ask server to relay transfer-request to the target peer
   signaling.send({ type: 'transfer-request', to: peerId, files: fileInfos });
   UI.toast('⏳ Aguardando confirmação…', 'info', 5000);
-}
-
-function triggerDownload (blob, name) {
-  const a  = document.createElement('a');
-  a.href   = URL.createObjectURL(blob);
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -609,26 +511,16 @@ function triggerDownload (blob, name) {
 // ═══════════════════════════════════════════════════════════════
 const signaling = new SignalingClient();
 
-signaling.addEventListener('open', () => {
-  UI.setConnected(true);
-  UI.showStatus('');
-  console.log('[WS] connected');
-});
-
+signaling.addEventListener('open',  () => { UI.setConnected(true);  UI.showStatus(''); });
 signaling.addEventListener('close', () => {
   UI.setConnected(false);
   UI.showStatus('Desconectado — reconectando…', true);
-  // Clear peers on disconnect (they'll be resent on reconnect)
-  for (const [id, peer] of knownPeers) {
-    UI.removePeerCard(peer.element);
-    knownPeers.delete(id);
-  }
+  for (const [id, peer] of knownPeers) { UI.removePeerCard(peer.element); knownPeers.delete(id); }
 });
 
 signaling.addEventListener('msg', ({ detail: msg }) => {
   switch (msg.type) {
 
-    // ── Server sends our identity + list of existing peers ──
     case 'welcome': {
       myPeerId = msg.peerId;
       myName   = msg.displayName;
@@ -648,60 +540,45 @@ signaling.addEventListener('msg', ({ detail: msg }) => {
       removePeer(msg.peerId);
       break;
 
-    // ── WebRTC signal relay (offer/answer/ICE) ──
     case 'signal': {
       let conn = activeConns.get(msg.from);
       if (!conn) {
-        // We are the receiver side — create non-initiator connection
         conn = new WebRTCConnection(msg.from, signaling, false);
         wireConnection(conn, msg.from, 'recv');
         activeConns.set(msg.from, conn);
       }
-      conn.handleSignal(msg.data).catch(e =>
-        console.error('[signal] handleSignal error', e)
-      );
+      conn.handleSignal(msg.data).catch(e => console.error('[signal] error', e));
       break;
     }
 
-    // ── Incoming transfer request: show accept/reject modal ──
     case 'transfer-request': {
       const peer     = knownPeers.get(msg.from);
       const fromName = peer?.displayName ?? 'Dispositivo desconhecido';
-
       UI.showReceivePrompt(fromName, msg.files, accepted => {
         signaling.send({ type: 'transfer-response', to: msg.from, accepted });
-        if (!accepted) {
-          UI.toast('Transferência recusada.', 'info', 2000);
-        }
+        if (!accepted) UI.toast('Transferência recusada.', 'info', 2000);
       });
       break;
     }
 
-    // ── Sender gets accept/reject answer ──
     case 'transfer-response': {
       const conn = activeConns.get(msg.from);
       if (!conn) break;
-
       if (msg.accepted) {
-        // Now initiate the WebRTC handshake
         conn.createOffer().catch(e => {
           console.error('[webrtc] createOffer error', e);
-          UI.toast('❌ Erro na conexão P2P.', 'error');
-          conn.close();
-          activeConns.delete(msg.from);
-          UI.closeSendProgress();
+          UI.toast('❌ Erro ao iniciar conexão P2P.', 'error');
+          conn.close(); activeConns.delete(msg.from);
         });
       } else {
         UI.toast('❌ Transferência recusada pelo destinatário.', 'error');
-        conn.close();
-        activeConns.delete(msg.from);
-        UI.closeSendProgress();
+        conn.close(); activeConns.delete(msg.from); UI.closeSendProgress();
       }
       break;
     }
 
     default:
-      console.warn('[WS] unknown message type:', msg.type);
+      console.warn('[WS] unknown msg type:', msg.type);
   }
 });
 
@@ -720,7 +597,6 @@ function removePeer (peerId) {
   UI.removePeerCard(peer.element);
   knownPeers.delete(peerId);
   UI.toast(`${peer.displayName} saiu da rede`, 'info', 2000);
-  // Clean up any active WebRTC connection
   const conn = activeConns.get(peerId);
   if (conn) { conn.close(); activeConns.delete(peerId); }
 }
