@@ -11,8 +11,10 @@ const BUFFER_THRESHOLD  = 1 * 1024 * 1024;    // pause sends above 1 MB buffered
 const BUFFER_RESUME     = 256 * 1024;         // resume below 256 KB
 const WS_RECONNECT_MS   = 3_000;
 const ICE_SERVERS       = [
-  { urls: 'stun:stun.l.google.com:19302'  },
-  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.l.google.com:53' },
+  { urls: 'stun:stun.l.google.com:80' },
+  { urls: 'stun:global.stun.twilio.com:3478' }
 ];
 
 // Peer icons — chosen deterministically by name
