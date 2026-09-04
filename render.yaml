@@ -1,0 +1,16 @@
+# render.yaml — Deploy automático no Render.com
+# Documentação: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: owl-airdrop
+    runtime: node
+    plan: free
+    buildCommand: npm install --production
+    startCommand: node server.js
+    envVars:
+      - key: BASE_PATH
+        value: /
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /
