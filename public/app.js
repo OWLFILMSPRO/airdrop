@@ -544,7 +544,6 @@ function wireConnection (conn, peerId, role, filesToSend) {
       UI.closeSendProgress();
       UI.toast('✅ Todos os arquivos enviados!', 'success');
       activeConns.delete(peerId);
-      conn.close();
     });
 
     conn.addEventListener('send-progress', e => {
